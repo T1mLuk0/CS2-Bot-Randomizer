@@ -5,6 +5,8 @@ CS2-Bot-Randomizer is a plugin based on CounterStrikeSharp that allows each bot 
 
 2. Allocate an MVP music kit to each bot
 
+3. added gun weapon skins to each bot 
+
 ![pic2](https://github.com/user-attachments/assets/f45ee14b-e994-4037-8ac8-caf36f8056a3)
 ![random_2](https://github.com/user-attachments/assets/e13ab9b5-1abc-4f1e-9b11-178c4dd3f420)
 # Installation
