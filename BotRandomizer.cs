@@ -1,22 +1,22 @@
-using BotHiderApi;
+using System.Drawing;
+using System.Linq;
+using System.Runtime.InteropServices;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
-using CounterStrikeSharp.API.Core.Capabilities;
-using CounterStrikeSharp.API.Modules.Commands;
-using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using CounterStrikeSharp.API.Modules.Utils;
-using System.Drawing;
+using Microsoft.Extensions.Logging;
 
 namespace BotRandomizer;
 
 public class BotRandomizerPlugin : BasePlugin
 {
-    public override string ModuleName => "BotRandomizer";
-    public override string ModuleVersion => "1.0.7";
-    public override string ModuleAuthor => "ed0ard";
-    public override string ModuleDescription => "Randomize agent model, music kit, knife, gloves and weapon skins for bots";
+    public override string ModuleName        => "BotRandomizer";
+    public override string ModuleVersion     => "1.2.0";
+    public override string ModuleAuthor      => "ed0ard & Misaka17032";
+    public override string ModuleDescription => "Randomize agent model, music kit, knife skins, and gloves for bots";
 
     private readonly Random _rng = new();
     private readonly Dictionary<int, string> _botModels = new();
@@ -24,22 +24,22 @@ public class BotRandomizerPlugin : BasePlugin
     private readonly Dictionary<int, int> _botKnives = new();
     private readonly Dictionary<int, int> _botKnifePaints = new();
     private readonly Dictionary<int, int> _botGloves = new();
-    private readonly Dictionary<int, ulong> _botSteamIds = new();
-    private List<ulong> _steamIdPool = new();
+
     private bool _handling = false;
     private MemoryFunctionVoid<nint, string, float>? _setAttrByName;
     private ulong _nextItemId = 0xF00DCAFE;
-    private HashSet<nint> _skinnedWeapons = new();
-    private static readonly PluginCapability<IBotHiderApi> _botHiderCapability =
-        new("bothider:api");
-    private IBotHiderApi? _botHiderApi;
 
+    // Guards ApplySkinToWeapon's error log so it fires at most once per load cycle.
+    private bool _skinErrorLogged = false;
 
-    // True for engine bots and BotHider bots alike.
-    private bool IsBotPlayer(CCSPlayerController? c)
-        => c != null && (c.IsBot || (_botHiderApi?.IsManagedBot(c.Slot) ?? false));
+    // (weapon defindex, paint kit) pairs whose skin was authored for the legacy
+    // CS:GO weapon model. Loaded from skins_en.json. CS2 weapon viewmodels carry
+    // a "body" bodygroup: value 0 = current model UVs, value 1 = legacy model UVs.
+    private readonly HashSet<(ushort DefIndex, int Paint)> _legacyPaints = new();
 
-
+    // Chosen gun paint per (bot slot, weapon defindex). Guns are skinned from
+    // several places (the GiveNamedItem hook plus spawn timers); 
+    private readonly Dictionary<(int Slot, ushort DefIndex), int> _botGunPaints = new();
 
     // Knife-universal paint kit ids. Validated against skins_en.json to work on
     // all 4 knife subclasses (bayonet, karambit, m9, butterfly).
@@ -252,40 +252,24 @@ public class BotRandomizerPlugin : BasePlugin
         93,  94,  95,  96,  98,  99, 100, 101, 102, 103,
     };
 
-    public override void OnAllPluginsLoaded(bool hotReload)
-    {
-        // Optional BotHider capability (null if not installed).
-        try { _botHiderApi = _botHiderCapability.Get(); }
-        catch { _botHiderApi = null; }
-        Server.PrintToConsole(_botHiderApi != null
-            ? "[Botrandomizer] BotHider API resolved (disguised bots supported)"
-            : "[Botrandomizer] BotHider API not present");
-    }
-
-
 
     public override void Load(bool hotReload)
     {
-        LoadSteamIdPool();
+        // Avoid generating too many logs
+        _skinErrorLogged = false;
+        LoadLegacyPaints();
 
         try
         {
-            var sig = GameData.GetSignature("CAttributeList_SetOrAddAttributeValueByName");
-            if (string.IsNullOrEmpty(sig))
-            {
-                Console.WriteLine("[BotRandomizer] CAttributeList_SetOrAddAttributeValueByName: empty signature returned (gamedata file not loaded?)");
-                _setAttrByName = null;
-            }
-            else
-            {
-                _setAttrByName = new MemoryFunctionVoid<nint, string, float>(sig);
-                Console.WriteLine($"[BotRandomizer] CAttributeList_SetOrAddAttributeValueByName loaded, sig len={sig.Length}");
-            }
+            _setAttrByName = new MemoryFunctionVoid<nint, string, float>(
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux) // 2026.06.08 verified
+                    ? "55 48 89 E5 41 57 41 56 49 89 FE 41 55 41 54 53 48 89 F3 48 83 EC ? F3 0F 11 85"
+                    : "40 53 55 41 56 48 81 EC 90 00 00 00");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[BotRandomizer] CAttributeList_SetOrAddAttributeValueByName signature lookup failed: {ex.Message} (skins/gloves disabled)");
             _setAttrByName = null;
+            Logger.LogError($"[BotRandomizer] SetOrAddAttributeValueByName signature failed: {ex.Message} (skins/gloves disabled)");
         }
 
         RegisterListener<Listeners.OnMapStart>(_ =>
@@ -295,52 +279,24 @@ public class BotRandomizerPlugin : BasePlugin
             _botKnives.Clear();
             _botKnifePaints.Clear();
             _botGloves.Clear();
-            _botSteamIds.Clear();
-            _skinnedWeapons.Clear();
-            LoadSteamIdPool();
+            _botGunPaints.Clear();
             foreach (var m in CtModels) Server.PrecacheModel(m);
-            foreach (var m in TModels) Server.PrecacheModel(m);
-
-            AddTimer(1.0f, AutoExecBotCfg);
+            foreach (var m in TModels)  Server.PrecacheModel(m);
         });
 
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
         RegisterEventHandler<EventRoundMvp>(OnRoundMvp, HookMode.Pre);
         RegisterEventHandler<EventPlayerTeam>(OnPlayerTeam);
-        RegisterEventHandler<EventItemPickup>(OnItemPickup);
-        
 
-        AddCommandListener("bot_kick", OnBotKickCommand);
-    }
-    private HookResult OnItemPickup(EventItemPickup @event, GameEventInfo info)
-    {
-        var player = @event.Userid;
-        if (player == null || !IsBotPlayer(player)) return HookResult.Continue;
-
-        var pawn = player.PlayerPawn?.Value;
-        if (pawn == null) return HookResult.Continue;
-
-        
-        ApplyWeaponSkins(pawn);
-
-        return HookResult.Continue;
+        // Skin a bot's gun the instant the engine hands it the weapon.
+        VirtualFunctions.GiveNamedItemFunc.Hook(OnGiveNamedItemPost, HookMode.Post);
     }
 
-
-
-    private HookResult OnBotKickCommand(CCSPlayerController? player, CommandInfo info)
+    public override void Unload(bool hotReload)
     {
-        var bots = Utilities.GetPlayers()
-            .Where(p => p != null && p.IsValid && IsBotPlayer(p))
-            .ToList();
-
-        foreach (var bot in bots)
-        {
-            if (bot.UserId.HasValue)
-                Server.ExecuteCommand($"kickid {bot.UserId.Value}");
-        }
-
-        return HookResult.Handled;
+        // Event handlers, listeners and commands are auto-removed by BasePlugin,
+        // but this global function hook is not.
+        VirtualFunctions.GiveNamedItemFunc.Unhook(OnGiveNamedItemPost, HookMode.Post);
     }
 
     [GameEventHandler]
@@ -350,7 +306,7 @@ public class BotRandomizerPlugin : BasePlugin
 
         if (player == null
             || !player.IsValid
-            || !IsBotPlayer(player)
+            || !player.IsBot
             || player.PlayerPawn == null
             || !player.PlayerPawn.IsValid
             || player.PlayerPawn.Value == null
@@ -380,16 +336,12 @@ public class BotRandomizerPlugin : BasePlugin
         if (!_botGloves.ContainsKey(player.Slot))
             _botGloves[player.Slot] = _rng.Next(Gloves.Length);
 
-        if (!_botSteamIds.ContainsKey(player.Slot) && _steamIdPool.Count > 0)
-            _botSteamIds[player.Slot] = _steamIdPool[_rng.Next(_steamIdPool.Count)];
-
-        var pawn = player.PlayerPawn.Value;
+        var pawn          = player.PlayerPawn.Value;
         var assignedModel = model;
-        var kitId = _botKits[player.Slot];
-        var knife = Knives[_botKnives[player.Slot]];
-        var knifePaint = _botKnifePaints[player.Slot];
-        var glove = Gloves[_botGloves[player.Slot]];
-        ulong steamId = _botSteamIds.TryGetValue(player.Slot, out var sid) ? sid : 0UL;
+        var kitId         = _botKits[player.Slot];
+        var knife         = Knives[_botKnives[player.Slot]];
+        var knifePaint    = _botKnifePaints[player.Slot];
+        var glove         = Gloves[_botGloves[player.Slot]];
 
         Server.NextFrame(() =>
         {
@@ -403,20 +355,13 @@ public class BotRandomizerPlugin : BasePlugin
             Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_clrRender");
 
             if (player == null || !player.IsValid) return;
+
             player.MusicKitID = kitId;
             Utilities.SetStateChanged(player, "CCSPlayerController", "m_iMusicKitID");
 
             ApplyWearables(player, pawn, knife.DefIndex, knifePaint, glove.DefIndex, glove.PaintKit);
-
-            if (steamId != 0UL && player.SteamID == 0)
-            {
-                try
-                {
-                    player.SteamID = steamId;
-                    Utilities.SetStateChanged(player, "CBasePlayerController", "m_steamID");
-                }
-                catch { }
-            }
+            AddTimer(0.10f, () => ApplyWearables(player, pawn, knife.DefIndex, knifePaint, glove.DefIndex, glove.PaintKit));
+            AddTimer(0.25f, () => ApplyWearables(player, pawn, knife.DefIndex, knifePaint, glove.DefIndex, glove.PaintKit));
         });
 
         return HookResult.Continue;
@@ -424,9 +369,146 @@ public class BotRandomizerPlugin : BasePlugin
 
     private void ApplyWearables(CCSPlayerController player, CCSPlayerPawn pawn, ushort knifeDefIndex, int knifePaintKit, ushort gloveDefIndex, int glovePaintKit)
     {
+        if (player == null || !player.IsValid || !player.IsBot || pawn == null || !pawn.IsValid)
+            return;
+
         ReplaceKnife(pawn, knifeDefIndex, knifePaintKit);
         ApplyGloves(player, pawn, gloveDefIndex, glovePaintKit);
-        ApplyWeaponSkins(pawn);
+        ApplyWeaponSkins(player.Slot, pawn);
+    }
+
+    // Post-hook on GiveNamedItem: fires whenever the engine gives a weapon to a
+    // player (including every BotBuy buy/swap/drop). We skin it if the receiver is a bot.
+    // The skin is applied twice: once immediately, and once on the next frame.
+    private HookResult OnGiveNamedItemPost(DynamicHook hook)
+    {
+        if (_setAttrByName == null)
+            return HookResult.Continue;
+
+        try
+        {
+            var itemServices = hook.GetParam<CCSPlayer_ItemServices>(0);
+            var weapon = hook.GetReturn<CBasePlayerWeapon>();
+
+            if (weapon == null || !weapon.IsValid)
+                return HookResult.Continue;
+
+            var name = weapon.DesignerName;
+            if (string.IsNullOrEmpty(name) || !name.Contains("weapon"))
+                return HookResult.Continue;
+
+            var player = GetPlayerFromItemServices(itemServices);
+            if (player == null || !player.IsValid || !player.IsBot)
+                return HookResult.Continue;
+
+            int slot = player.Slot;
+            ApplyRandomSkin(slot, weapon);
+
+            // Re-apply once the weapon is fully initialized/deployed.
+            Server.NextFrame(() =>
+            {
+                if (weapon != null && weapon.IsValid)
+                    ApplyRandomSkin(slot, weapon);
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[BotRandomizer] OnGiveNamedItemPost failed: {ex.Message}");
+        }
+
+        return HookResult.Continue;
+    }
+
+    private static CCSPlayerController? GetPlayerFromItemServices(CCSPlayer_ItemServices itemServices)
+    {
+        var pawn = itemServices.Pawn.Value;
+        if (pawn == null || !pawn.IsValid || pawn.Controller.Value == null || !pawn.Controller.IsValid)
+            return null;
+
+        var player = new CCSPlayerController(pawn.Controller.Value.Handle);
+        return player.IsValid ? player : null;
+    }
+
+    private void ApplyWeaponSkins(int slot, CCSPlayerPawn pawn)
+    {
+        if (_setAttrByName == null) return;
+
+        var weapons = pawn.WeaponServices?.MyWeapons;
+        if (weapons == null) return;
+
+        foreach (var handle in weapons)
+            ApplyRandomSkin(slot, handle.Value);
+    }
+
+    // Apply this bot's skin to a single gun. Knives are skipped here; they are
+    // handled per-bot by ReplaceKnife. The paint is chosen once per
+    // (slot, defindex) and reused so repeated applications stay consistent.
+    private void ApplyRandomSkin(int slot, CBasePlayerWeapon? weapon)
+    {
+        if (_setAttrByName == null || weapon == null || !weapon.IsValid) return;
+
+        var name = weapon.DesignerName;
+        if (string.IsNullOrEmpty(name)) return;
+        if (name.Contains("knife") || name == "weapon_bayonet") return;
+
+        ushort defIndex = weapon.AttributeManager?.Item?.ItemDefinitionIndex ?? 0;
+        if (defIndex == 0) return;
+
+        if (!GunPaints.TryGetValue(defIndex, out int[]? paints) || paints == null || paints.Length == 0)
+            return;
+
+        var key = (slot, defIndex);
+        if (!_botGunPaints.TryGetValue(key, out int paint))
+        {
+            paint = paints[_rng.Next(paints.Length)];
+            _botGunPaints[key] = paint;
+        }
+
+        ApplySkinToWeapon(weapon, defIndex, paint);
+    }
+
+    private void ApplySkinToWeapon(CEconEntity weapon, ushort defIndex, int paintKit)
+    {
+        if (_setAttrByName == null) return;
+
+        try
+        {
+            var item = weapon.AttributeManager?.Item;
+            if (item == null) return;
+
+            // Clear any stale attributes from a previous application, then give the item a fresh fake ItemID.
+            item.AttributeList.Attributes.RemoveAll();
+            item.NetworkedDynamicAttributes.Attributes.RemoveAll();
+            AssignItemId(item);
+
+            weapon.FallbackPaintKit = paintKit;
+            weapon.FallbackSeed = 0;
+            weapon.FallbackWear = 0.01f;
+
+            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture prefab", paintKit);
+            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture seed", 0f);
+            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture wear", 0.01f);
+
+            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture prefab", paintKit);
+            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture seed", 0f);
+            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture wear", 0.01f);
+
+            Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
+
+            // Flip the weapon "body" bodygroup so the paint maps to the correct
+            // position: legacy-model skins use UV layout 1, current-model skins
+            // use layout 0. Without this the texture is misaligned on the mesh.
+            bool isLegacy = _legacyPaints.Contains((defIndex, paintKit));
+            weapon.AcceptInput("SetBodygroup", value: $"body,{(isLegacy ? 1 : 0)}");
+        }
+        catch (Exception ex)
+        {
+            if (!_skinErrorLogged)
+            {
+                _skinErrorLogged = true;
+                Logger.LogError($"[BotRandomizer] ApplySkinToWeapon failed: {ex.Message}");
+            }
+        }
     }
 
     private void ReplaceKnife(CCSPlayerPawn pawn, ushort defIndex, int paintKit)
@@ -443,6 +525,7 @@ public class BotRandomizerPlugin : BasePlugin
                 if (string.IsNullOrEmpty(name)) continue;
                 if (!(name.Contains("knife") || name == "weapon_bayonet")) continue;
 
+                // Engine-side subclass swap: re-resolves model/anim/HUD without re-creating the entity.
                 if (w.AttributeManager?.Item?.ItemDefinitionIndex != defIndex)
                     w.AcceptInput("ChangeSubclass", value: defIndex.ToString());
 
@@ -476,12 +559,19 @@ public class BotRandomizerPlugin : BasePlugin
                 break;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[BotRandomizer] ReplaceKnife failed: {ex.Message}");
+        }
     }
 
     private void ApplyGloves(CCSPlayerController player, CCSPlayerPawn pawn, ushort defIndex, int paintKit)
     {
-        if (_setAttrByName == null) return;
+        if (_setAttrByName == null)
+        {
+            Logger.LogInformation("[BotRandomizer] ApplyGloves skipped: CAttributeList_SetOrAddAttributeValueByName not loaded");
+            return;
+        }
         try
         {
             var item = pawn.EconGloves;
@@ -502,6 +592,7 @@ public class BotRandomizerPlugin : BasePlugin
 
             item.Initialized = true;
 
+            // Force a re-render of the glove model so the new mesh actually shows.
             pawn.AcceptInput("SetBodygroup", value: "first_or_third_person,0");
             AddTimer(0.2f, () =>
             {
@@ -509,91 +600,10 @@ public class BotRandomizerPlugin : BasePlugin
                     pawn.AcceptInput("SetBodygroup", value: "first_or_third_person,1");
             });
         }
-        catch { }
-    }
-
-    private void ApplyWeaponSkins(CCSPlayerPawn pawn)
-    {
-        if (_setAttrByName == null) return;
-
-        var weapons = pawn.WeaponServices?.MyWeapons;
-        if (weapons == null) return;
-
-        foreach (var handle in weapons)
-        {
-            var weapon = handle.Value;
-            if (weapon == null || !weapon.IsValid) continue;
-
-            var name = weapon.DesignerName;
-            if (string.IsNullOrEmpty(name)) continue;
-            if (name.Contains("knife") || name == "weapon_bayonet") continue;
-
-            ushort defIndex = weapon.AttributeManager?.Item?.ItemDefinitionIndex ?? 0;
-            if (defIndex == 0) continue;
-
-            if (!GunPaints.TryGetValue(defIndex, out int[]? paints) || paints == null || paints.Length == 0)
-                continue;
-
-            int randomPaint = paints[_rng.Next(paints.Length)];
-            ApplySkinToWeapon(weapon, randomPaint);
-        }
-    }
-
-    private void ApplySkinToWeapon(CEconEntity weapon, int paintKit)
-    {
-        if (_setAttrByName == null) return;
-
-        
-
-        try
-        {
-            var item = weapon.AttributeManager?.Item;
-            if (item == null) return;
-
-            weapon.FallbackPaintKit = paintKit;
-            weapon.FallbackSeed = 0;
-            weapon.FallbackWear = 0.01f;
-
-            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture prefab", paintKit);
-            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture seed", 0f);
-            _setAttrByName.Invoke(item.NetworkedDynamicAttributes.Handle, "set item texture wear", 0.01f);
-
-            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture prefab", paintKit);
-            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture seed", 0f);
-            _setAttrByName.Invoke(item.AttributeList.Handle, "set item texture wear", 0.01f);
-
-            
-
-            Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
-        }
         catch (Exception ex)
         {
-            Console.WriteLine($"[BotRandomizer] ApplySkinToWeapon failed: {ex.Message}");
+            Logger.LogError($"[BotRandomizer] ApplyGloves failed: {ex.Message}");
         }
-    }
-
-    private void LoadSteamIdPool()
-    {
-        var pool = new List<ulong>();
-        try
-        {
-            var path = Path.Combine(ModuleDirectory, "steamids.txt");
-            if (File.Exists(path))
-            {
-                foreach (var raw in File.ReadAllLines(path))
-                {
-                    var line = raw.Trim();
-                    if (line.Length == 0 || line.StartsWith("#")) continue;
-                    if (ulong.TryParse(line, out var id) && id > 0) pool.Add(id);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[BotRandomizer] LoadSteamIdPool failed: {ex.Message}");
-        }
-        _steamIdPool = pool;
-        Console.WriteLine($"[BotRandomizer] Loaded {_steamIdPool.Count} SteamIDs from steamids.txt");
     }
 
     private void AssignItemId(CEconItemView item)
@@ -604,30 +614,65 @@ public class BotRandomizerPlugin : BasePlugin
         item.ItemIDHigh = (uint)(id >> 32);
     }
 
-    private static void AutoExecBotCfg()
+    // Build the legacy-model lookup from skins_en.json.
+    // Each entry: { "weapon_defindex": int, "paint": int|string, "legacy_model": bool }.
+    private void LoadLegacyPaints()
     {
-        string cfg = "my_bot_normal_config";
+        _legacyPaints.Clear();
         try
         {
-            var gameType = ConVar.Find("game_type")?.GetPrimitiveValue<int>() ?? -1;
-            var gameMode = ConVar.Find("game_mode")?.GetPrimitiveValue<int>() ?? -1;
-            if (gameType == 1 && gameMode == 2)
-                cfg = "my_bot_ffa_config";
-        }
-        catch { }
+            var path = Path.Combine(ModuleDirectory, "skins_en.json");
+            if (!File.Exists(path))
+            {
+                Logger.LogWarning("[BotRandomizer] skins_en.json not found; weapon skins may map to the wrong model position");
+                return;
+            }
 
-        Console.WriteLine($"[BotRandomizer] Auto-exec {cfg}.cfg");
-        Server.ExecuteCommand($"exec {cfg}");
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                if (!el.TryGetProperty("legacy_model", out var legacyEl)
+                    || legacyEl.ValueKind != System.Text.Json.JsonValueKind.True)
+                    continue;
+                if (!el.TryGetProperty("weapon_defindex", out var defEl)) continue;
+                if (!el.TryGetProperty("paint", out var paintEl)) continue;
+
+                _legacyPaints.Add(((ushort)ReadInt(defEl), ReadInt(paintEl)));
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[BotRandomizer] LoadLegacyPaints failed: {ex.Message}");
+        }
+
+        // "paint"/"weapon_defindex" may be encoded as a JSON number or string.
+        static int ReadInt(System.Text.Json.JsonElement e) =>
+            e.ValueKind == System.Text.Json.JsonValueKind.Number
+                ? e.GetInt32()
+                : int.TryParse(e.GetString(), out var v) ? v : 0;
     }
 
     [GameEventHandler]
     public HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
     {
         var player = @event.Userid;
-        if (player == null || !player.IsValid || !IsBotPlayer(player))
+        if (player == null || !player.IsValid || !player.IsBot)
             return HookResult.Continue;
 
-        _botModels.Remove(player.Slot);
+        // Switching sides re-rolls this bot's whole cosmetic
+        // loadout so it gets a fresh, re-bound identity for its new team. The
+        // model is team-specific (CT vs T pools) and must change; knife, gloves
+        // and weapon skins are re-rolled with it so everything refreshes together.
+        // After this they stay bound until the next team change or map start.
+        // Music kits are intentionally kept for the whole map.
+        int slot = player.Slot;
+        _botModels.Remove(slot);
+        _botKnives.Remove(slot);
+        _botKnifePaints.Remove(slot);
+        _botGloves.Remove(slot);
+        foreach (var key in _botGunPaints.Keys.Where(k => k.Slot == slot).ToList())
+            _botGunPaints.Remove(key);
+
         return HookResult.Continue;
     }
 
@@ -639,7 +684,7 @@ public class BotRandomizerPlugin : BasePlugin
 
         var player = @event.Userid;
 
-        if (player == null || !player.IsValid || !IsBotPlayer(player))
+        if (player == null || !player.IsValid || !player.IsBot)
             return HookResult.Continue;
 
         if (!_botKits.TryGetValue(player.Slot, out int kitId))
@@ -659,15 +704,15 @@ public class BotRandomizerPlugin : BasePlugin
         {
             newEvent = new EventRoundMvp(true)
             {
-                Userid = player,
+                Userid     = player,
                 Musickitid = kitId,
-                Nomusic = 0,
-                Reason = @event.Reason,
-                Value = @event.Value,
+                Nomusic    = 0,
+                Reason     = @event.Reason,
+                Value      = @event.Value,
             };
 
             foreach (var human in Utilities.GetPlayers()
-                         .Where(p => p.IsValid && !p.IsHLTV && !IsBotPlayer(p)))
+                         .Where(p => p.IsValid && !p.IsHLTV && !p.IsBot))
             {
                 try { newEvent.FireEventToClient(human); }
                 catch { }
