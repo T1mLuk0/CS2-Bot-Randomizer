@@ -13,13 +13,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Reference Include="BotHiderApi">
-      <HintPath>..\..\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\addons\counterstrikesharp\shared\BotHiderApi\BotHiderApi.dll</HintPath>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
     <None Update="gamedata\*.*" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="skins_en.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
